@@ -1,0 +1,297 @@
+import Combine
+import Foundation
+import Network
+
+@MainActor
+final class LinkServer: ObservableObject {
+    @Published private(set) var isListening = false
+    @Published private(set) var isConnected = false
+    @Published private(set) var statusText = "Starting…"
+    @Published private(set) var pairingJSON = ""
+    @Published private(set) var lastReceivedFile: String?
+    @Published private(set) var localAddress = "127.0.0.1"
+
+    let clipboard = ClipboardMonitor()
+    private let fileReceiver = FileReceiver()
+    private let fileSender = FileSender()
+
+    private var listener: NWListener?
+    private var connection: NWConnection?
+    private var receiveBuffer = Data()
+    private var authToken = UUID().uuidString
+    private var keepAliveTimer: Timer?
+
+    func start() {
+        authToken = UUID().uuidString
+        localAddress = Self.primaryIPv4Address() ?? "127.0.0.1"
+        updatePairingJSON()
+
+        do {
+            let params = NWParameters.tcp
+            listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: LinkProtocol.defaultPort)!)
+        } catch {
+            statusText = "Failed to start: \(error.localizedDescription)"
+            return
+        }
+
+        listener?.stateUpdateHandler = { [weak self] state in
+            Task { @MainActor in
+                switch state {
+                case .ready:
+                    self?.isListening = true
+                    self?.statusText = "Waiting for Android…"
+                case .failed(let error):
+                    self?.isListening = false
+                    self?.statusText = "Listener failed: \(error.localizedDescription)"
+                default:
+                    break
+                }
+            }
+        }
+
+        listener?.newConnectionHandler = { [weak self] connection in
+            Task { @MainActor in
+                self?.attach(connection: connection)
+            }
+        }
+
+        listener?.start(queue: .global(qos: .userInitiated))
+        clipboard.onRemotePaste = { [weak self] text in
+            self?.sendClipboard(text)
+        }
+    }
+
+    func stop() {
+        keepAliveTimer?.invalidate()
+        keepAliveTimer = nil
+        clipboard.stop()
+        connection?.cancel()
+        connection = nil
+        listener?.cancel()
+        listener = nil
+        isConnected = false
+        isListening = false
+        statusText = "Stopped"
+    }
+
+    func restartPairing() {
+        connection?.cancel()
+        connection = nil
+        isConnected = false
+        authToken = UUID().uuidString
+        updatePairingJSON()
+        statusText = "Waiting for Android…"
+    }
+
+    func sendFile(url: URL) {
+        guard isConnected else {
+            statusText = "Connect Android first"
+            return
+        }
+        Task.detached { [weak self] in
+            do {
+                try self?.fileSender.send(url: url) { type, payload in
+                    Task { @MainActor in
+                        self?.send(type: type, payload: payload)
+                    }
+                }
+                await MainActor.run {
+                    self?.statusText = "Sent \(url.lastPathComponent)"
+                }
+            } catch {
+                await MainActor.run {
+                    self?.statusText = "Send failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func attach(connection: NWConnection) {
+        self.connection?.cancel()
+        self.connection = connection
+        receiveBuffer.removeAll(keepingCapacity: true)
+
+        connection.stateUpdateHandler = { [weak self] state in
+            Task { @MainActor in
+                switch state {
+                case .ready:
+                    self?.receiveLoop()
+                case .failed, .cancelled:
+                    self?.handleDisconnect()
+                default:
+                    break
+                }
+            }
+        }
+        connection.start(queue: .global(qos: .userInitiated))
+    }
+
+    private func receiveLoop() {
+        connection?.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { [weak self] data, _, isComplete, error in
+            Task { @MainActor in
+                guard let self else { return }
+                if let data, !data.isEmpty {
+                    self.receiveBuffer.append(data)
+                    self.processBuffer()
+                }
+                if error != nil || isComplete {
+                    self.handleDisconnect()
+                    return
+                }
+                self.receiveLoop()
+            }
+        }
+    }
+
+    private func processBuffer() {
+        let messages = LinkProtocol.decodeFrames(from: &receiveBuffer)
+        for (type, payload) in messages {
+            handle(type: type, payload: payload)
+        }
+    }
+
+    private func handle(type: MessageType, payload: Data) {
+        switch type {
+        case .auth:
+            let token = String(data: payload, encoding: .utf8) ?? ""
+            if token == authToken {
+                send(type: .authOK)
+                isConnected = true
+                statusText = "Connected"
+                clipboard.start()
+                startKeepAlive()
+            } else {
+                send(type: .authFail, payload: Data("Invalid token".utf8))
+                connection?.cancel()
+            }
+
+        case .clipboard:
+            guard let json = LinkProtocol.jsonObject(from: payload),
+                  let text = json["text"] as? String,
+                  !text.isEmpty else { return }
+            let from = json["from"] as? String ?? ""
+            guard from != DeviceSide.mac.rawValue else { return }
+            clipboard.applyRemoteText(text)
+            statusText = "Clipboard updated from Android"
+
+        case .fileBegin:
+            guard let json = LinkProtocol.jsonObject(from: payload),
+                  let id = json["id"] as? String,
+                  let name = json["name"] as? String else { return }
+            let size = Self.int64(json["size"]) ?? 0
+            try? fileReceiver.handleBegin(id: id, name: name, size: size)
+            statusText = "Receiving \(name)…"
+
+        case .fileChunk:
+            guard payload.count >= 4 else { return }
+            let jsonLength = payload.prefix(4).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+            let headerEnd = 4 + Int(jsonLength)
+            guard payload.count > headerEnd,
+                  let json = LinkProtocol.jsonObject(from: payload.subdata(in: 4..<headerEnd)),
+                  let id = json["id"] as? String,
+                  let offset = Self.int64(json["offset"]) else { return }
+            let chunk = payload.subdata(in: headerEnd..<payload.count)
+            try? fileReceiver.handleChunk(id: id, offset: offset, data: chunk)
+
+        case .fileEnd:
+            guard let json = LinkProtocol.jsonObject(from: payload),
+                  let id = json["id"] as? String else { return }
+            if let url = fileReceiver.handleEnd(id: id) {
+                lastReceivedFile = url.lastPathComponent
+                statusText = "Received \(url.lastPathComponent)"
+            }
+
+        case .ping:
+            send(type: .pong)
+
+        case .pong:
+            break
+
+        default:
+            break
+        }
+    }
+
+    private func send(type: MessageType, payload: Data = Data()) {
+        let frame = LinkProtocol.encode(type: type, payload: payload)
+        connection?.send(content: frame, completion: .contentProcessed { _ in })
+    }
+
+    private func sendClipboard(_ text: String) {
+        let payload = LinkProtocol.jsonData([
+            "text": text,
+            "from": DeviceSide.mac.rawValue
+        ])
+        send(type: .clipboard, payload: payload)
+    }
+
+    private func startKeepAlive() {
+        keepAliveTimer?.invalidate()
+        keepAliveTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.send(type: .ping)
+            }
+        }
+    }
+
+    private func handleDisconnect() {
+        keepAliveTimer?.invalidate()
+        keepAliveTimer = nil
+        clipboard.stop()
+        isConnected = false
+        statusText = "Waiting for phone to reconnect…"
+        connection = nil
+    }
+
+    private func updatePairingJSON() {
+        let payload = PairingPayload(
+            v: 1,
+            host: localAddress,
+            port: Int(LinkProtocol.defaultPort),
+            token: authToken
+        )
+        if let data = try? JSONEncoder().encode(payload),
+           let json = String(data: data, encoding: .utf8) {
+            pairingJSON = json
+        }
+    }
+
+    private static func int64(_ value: Any?) -> Int64? {
+        if let value = value as? Int64 { return value }
+        if let value = value as? Int { return Int64(value) }
+        if let value = value as? NSNumber { return value.int64Value }
+        return nil
+    }
+
+    private static func primaryIPv4Address() -> String? {
+        var address: String?
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let interface = ptr.pointee
+            let family = interface.ifa_addr.pointee.sa_family
+            guard family == UInt8(AF_INET) else { continue }
+            let name = String(cString: interface.ifa_name)
+            guard name.hasPrefix("en") || name.hasPrefix("wl") else { continue }
+
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            getnameinfo(
+                interface.ifa_addr,
+                socklen_t(interface.ifa_addr.pointee.sa_len),
+                &hostname,
+                socklen_t(hostname.count),
+                nil,
+                0,
+                NI_NUMERICHOST
+            )
+            let ip = String(cString: hostname)
+            if !ip.hasPrefix("127.") {
+                address = ip
+                break
+            }
+        }
+        return address
+    }
+}

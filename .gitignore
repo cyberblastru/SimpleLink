@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+.build/
+.swiftpm/
+macos/.build/
+macos/dist/
+macos/SimpleLink.app
+macos/Resources/AppIcon.iconset/
+macos/Resources/AppIcon.icns
+
+# Android
+android/.gradle/
+android/local.properties
+android/**/build/
+android/.idea/
+*.iml
+*.apk
+*.aab
+
+# Secrets
+.env
+*.keystore
