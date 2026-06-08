@@ -1,6 +1,54 @@
 #!/usr/bin/env swift
 import AppKit
 
+let brandBlue = NSColor(
+    calibratedRed: 37.0 / 255.0,
+    green: 99.0 / 255.0,
+    blue: 235.0 / 255.0,
+    alpha: 1
+)
+
+let diamondViewport: [(CGFloat, CGFloat)] = [
+    (30, 54), (54, 30), (78, 54), (54, 78)
+]
+
+func mapAndroidPoint(_ point: (CGFloat, CGFloat), in rect: NSRect) -> NSPoint {
+    NSPoint(
+        x: rect.minX + (point.0 / 108.0) * rect.width,
+        y: rect.minY + (1.0 - point.1 / 108.0) * rect.height
+    )
+}
+
+func diamondPath(in rect: NSRect) -> NSBezierPath {
+    let path = NSBezierPath()
+    for (index, point) in diamondViewport.enumerated() {
+        let mapped = mapAndroidPoint(point, in: rect)
+        if index == 0 {
+            path.move(to: mapped)
+        } else {
+            path.line(to: mapped)
+        }
+    }
+    path.close()
+    return path
+}
+
+func drawAppIcon(size: Int) -> NSImage {
+    let side = CGFloat(size)
+    let image = NSImage(size: NSSize(width: side, height: side))
+    image.lockFocus()
+
+    let rect = NSRect(x: 0, y: 0, width: side, height: side)
+    brandBlue.setFill()
+    NSBezierPath(rect: rect).fill()
+
+    NSColor.white.setFill()
+    diamondPath(in: rect).fill()
+
+    image.unlockFocus()
+    return image
+}
+
 let sizes: [(String, Int)] = [
     ("icon_16x16.png", 16),
     ("icon_16x16@2x.png", 32),
@@ -18,26 +66,7 @@ let iconsetURL = URL(fileURLWithPath: "Resources/AppIcon.iconset", isDirectory: 
 try FileManager.default.createDirectory(at: iconsetURL, withIntermediateDirectories: true)
 
 for (name, size) in sizes {
-    let image = NSImage(size: NSSize(width: size, height: size))
-    image.lockFocus()
-    NSColor(calibratedRed: 0.15, green: 0.39, blue: 0.92, alpha: 1).setFill()
-    NSBezierPath(rect: NSRect(x: 0, y: 0, width: size, height: size)).fill()
-
-    let fontSize = CGFloat(size) * 0.34
-    let attrs: [NSAttributedString.Key: Any] = [
-        .font: NSFont.systemFont(ofSize: fontSize, weight: .bold),
-        .foregroundColor: NSColor.white
-    ]
-    let text = "SL" as NSString
-    let textSize = text.size(withAttributes: attrs)
-    let rect = NSRect(
-        x: (CGFloat(size) - textSize.width) / 2,
-        y: (CGFloat(size) - textSize.height) / 2,
-        width: textSize.width,
-        height: textSize.height
-    )
-    text.draw(in: rect, withAttributes: attrs)
-    image.unlockFocus()
+    let image = drawAppIcon(size: size)
 
     guard
         let tiff = image.tiffRepresentation,
