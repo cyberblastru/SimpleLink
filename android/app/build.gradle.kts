@@ -45,6 +45,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.documentfile:documentfile:1.0.1")
 
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
     implementation("androidx.camera:camera-camera2:1.4.0")

@@ -20,6 +20,8 @@ final class LinkServer: ObservableObject {
     private var receiveBuffer = Data()
     private var authToken = UUID().uuidString
     private var keepAliveTimer: Timer?
+    private var receiveProgress = BatchReceiveProgress()
+    private var lastSendPercent = -1
 
     func start() {
         authToken = UUID().uuidString
@@ -83,27 +85,63 @@ final class LinkServer: ObservableObject {
         statusText = "Waiting for Android…"
     }
 
-    func sendFile(url: URL) {
+    func sendFiles(urls: [URL]) {
         guard isConnected else {
             statusText = "Connect Android first"
             return
         }
+        guard !urls.isEmpty else { return }
+        lastSendPercent = -1
         Task.detached { [weak self] in
             do {
-                try self?.fileSender.send(url: url) { type, payload in
+                let sender = await MainActor.run { self?.fileSender }
+                guard let sender else { return }
+                let count = try sender.collectItems(from: urls).count
+                try sender.sendItems(from: urls, emit: { type, payload in
                     Task { @MainActor in
                         self?.send(type: type, payload: payload)
                     }
-                }
+                }, onProgress: { done, total in
+                    Task { @MainActor in
+                        self?.reportSendProgress(done: done, total: total)
+                    }
+                })
                 await MainActor.run {
-                    self?.statusText = "Sent \(url.lastPathComponent)"
+                    if count == 1, let name = urls.first?.lastPathComponent {
+                        self?.statusText = "Sent \(name)"
+                    } else {
+                        self?.statusText = "Sent \(count) items"
+                    }
+                    self?.lastSendPercent = -1
                 }
             } catch {
                 await MainActor.run {
                     self?.statusText = "Send failed: \(error.localizedDescription)"
+                    self?.lastSendPercent = -1
                 }
             }
         }
+    }
+
+    private func reportSendProgress(done: Int64, total: Int64) {
+        let percent = TransferProgress.percent(done: done, total: total)
+        guard percent != lastSendPercent else { return }
+        lastSendPercent = percent
+        statusText = TransferProgress.sending(done: done, total: total)
+    }
+
+    private func reportReceiveProgress() {
+        let percent = receiveProgress.currentPercent()
+        guard percent != receiveProgress.lastPercent else { return }
+        receiveProgress.markReported(percent)
+        statusText = TransferProgress.receiving(
+            done: receiveProgress.doneBytes,
+            total: receiveProgress.batchTotal
+        )
+    }
+
+    func sendFile(url: URL) {
+        sendFiles(urls: [url])
     }
 
     private func attach(connection: NWConnection) {
@@ -179,8 +217,12 @@ final class LinkServer: ObservableObject {
                   let id = json["id"] as? String,
                   let name = json["name"] as? String else { return }
             let size = Self.int64(json["size"]) ?? 0
-            try? fileReceiver.handleBegin(id: id, name: name, size: size)
-            statusText = "Receiving \(name)…"
+            let path = json["path"] as? String
+            let batchTotal = Self.int64(json["batchTotal"]) ?? size
+            let batchOffset = Self.int64(json["batchOffset"]) ?? 0
+            try? fileReceiver.handleBegin(id: id, name: name, size: size, relativePath: path)
+            receiveProgress.begin(batchTotal: batchTotal, batchOffset: batchOffset)
+            reportReceiveProgress()
 
         case .fileChunk:
             guard payload.count >= 4 else { return }
@@ -192,6 +234,8 @@ final class LinkServer: ObservableObject {
                   let offset = Self.int64(json["offset"]) else { return }
             let chunk = payload.subdata(in: headerEnd..<payload.count)
             try? fileReceiver.handleChunk(id: id, offset: offset, data: chunk)
+            receiveProgress.trackChunk(offset: offset, size: chunk.count)
+            reportReceiveProgress()
 
         case .fileEnd:
             guard let json = LinkProtocol.jsonObject(from: payload),

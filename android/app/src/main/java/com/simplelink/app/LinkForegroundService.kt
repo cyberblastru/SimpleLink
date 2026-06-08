@@ -9,20 +9,20 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
-import android.os.PowerManager
 import android.content.pm.ServiceInfo
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 
 class LinkForegroundService : Service() {
-    private var wakeLock: PowerManager.WakeLock? = null
+    private lateinit var locks: ConnectionLocks
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         instance = this
+        locks = ConnectionLocks(this)
         ensureChannel()
     }
 
@@ -36,14 +36,12 @@ class LinkForegroundService : Service() {
         when (action) {
             ACTION_STOP -> {
                 LinkSession.shutdownConnection()
-                releaseWakeLock()
-                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                stopServiceSafely()
             }
 
             ACTION_CONNECT -> {
+                locks.acquire()
                 promoteToForeground("Connecting…", connected = false)
-                acquireWakeLock()
                 val json = intent.getStringExtra(EXTRA_PAIRING)
                 if (json == null) {
                     applyStatus("Missing pairing data", connected = false)
@@ -60,8 +58,8 @@ class LinkForegroundService : Service() {
             }
 
             ACTION_RECONNECT -> {
+                locks.acquire()
                 promoteToForeground("Reconnecting…", connected = false)
-                acquireWakeLock()
             }
         }
         return START_NOT_STICKY
@@ -71,13 +69,15 @@ class LinkForegroundService : Service() {
         if (instance === this) {
             instance = null
         }
-        releaseWakeLock()
+        if (::locks.isInitialized) {
+            locks.release()
+        }
         super.onDestroy()
     }
 
     internal fun applyStatus(status: String, connected: Boolean) {
+        locks.acquire()
         promoteToForeground(status, connected)
-        if (connected) acquireWakeLock() else releaseWakeLock()
     }
 
     private fun promoteToForeground(status: String, connected: Boolean) {
@@ -94,23 +94,9 @@ class LinkForegroundService : Service() {
     }
 
     private fun stopServiceSafely() {
-        releaseWakeLock()
+        locks.release()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
-    }
-
-    private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        val manager = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = manager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SimpleLink:Connection").apply {
-            setReferenceCounted(false)
-            acquire(WAKE_LOCK_TIMEOUT_MS)
-        }
-    }
-
-    private fun releaseWakeLock() {
-        wakeLock?.let { if (it.isHeld) it.release() }
-        wakeLock = null
     }
 
     private fun ensureChannel() {
@@ -163,7 +149,6 @@ class LinkForegroundService : Service() {
 
         private const val CHANNEL_ID = "simplelink_connection"
         private const val NOTIFICATION_ID = 1
-        private const val WAKE_LOCK_TIMEOUT_MS = 10 * 60 * 60 * 1000L
 
         @Volatile
         private var instance: LinkForegroundService? = null

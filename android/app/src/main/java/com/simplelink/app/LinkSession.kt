@@ -58,6 +58,36 @@ object LinkSession {
         client.sendFile(file)
     }
 
+    fun sendFiles(files: List<ContextFile>) {
+        ensureReady()
+        client.sendFiles(files)
+    }
+
+    fun handleShare(context: Context, payload: SharePayload): ShareResult {
+        ensureReady()
+        if (!client.connected.value) {
+            return ShareResult.NotConnected
+        }
+        return when (payload) {
+            is SharePayload.Text -> {
+                client.sendSharedText(payload.text)
+                ShareResult.Sent
+            }
+            is SharePayload.Files -> {
+                val files = contextFilesFromUris(context, payload.uris)
+                if (files.isEmpty()) return ShareResult.Unsupported
+                client.sendFiles(files)
+                ShareResult.Sent
+            }
+        }
+    }
+
+    enum class ShareResult {
+        Sent,
+        NotConnected,
+        Unsupported
+    }
+
     fun pollClipboard() {
         if (::client.isInitialized) {
             client.pollClipboard()

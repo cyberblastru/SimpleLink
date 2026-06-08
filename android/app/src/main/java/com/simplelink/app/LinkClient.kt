@@ -48,6 +48,8 @@ class LinkClient(
     private val receiveBuffer = mutableListOf<Byte>()
     private val fileReceiver = FileReceiver(context)
     private val fileSender = FileSender()
+    private val receiveProgress = BatchReceiveProgress()
+    private var lastSendPercent = -1
     private var clipboardMonitor: ClipboardMonitor? = null
 
     fun connect(pairing: PairingPayload, enableAutoReconnect: Boolean = true) {
@@ -97,21 +99,75 @@ class LinkClient(
     }
 
     fun sendFile(file: ContextFile) {
+        sendFiles(listOf(file))
+    }
+
+    fun sendSharedText(text: String) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) {
+            setStatus("Nothing to send", connected = _connected.value)
+            return
+        }
+        if (!_connected.value) {
+            setStatus("Not connected", connected = false)
+            return
+        }
+        sendClipboard(trimmed)
+        setStatus("Sent to Mac clipboard", connected = true)
+    }
+
+    fun sendFiles(files: List<ContextFile>) {
+        if (files.isEmpty()) return
         val out = output ?: run {
             setStatus("Not connected", connected = false)
             return
         }
         scope.launch(Dispatchers.IO) {
             try {
-                setStatus("Sending ${file.name}…", connected = true)
+                val batchTotal = files.sumOf { it.size.coerceAtLeast(0) }.coerceAtLeast(1)
+                var batchOffset = 0L
+                lastSendPercent = -1
                 sendMutex.withLock {
-                    fileSender.send(file, out)
+                    files.forEach { file ->
+                        fileSender.send(
+                            file = file,
+                            output = out,
+                            batchTotal = batchTotal,
+                            batchOffset = batchOffset
+                        ) { done, total ->
+                            reportSendProgress(done, total)
+                        }
+                        batchOffset += file.size.coerceAtLeast(0)
+                    }
                 }
-                setStatus("Sent ${file.name}", connected = true)
+                reportSendProgress(batchTotal, batchTotal, force = true)
+                setStatus(
+                    if (files.size == 1) "Sent ${files.first().name}" else "Sent ${files.size} items",
+                    connected = true
+                )
+                lastSendPercent = -1
             } catch (e: Exception) {
-                setStatus("Send failed: ${e.message}", connected = true)
+                setStatus("Send failed: ${e.message}", connected = _connected.value)
+                lastSendPercent = -1
             }
         }
+    }
+
+    private fun reportSendProgress(done: Long, total: Long, force: Boolean = false) {
+        val percent = TransferProgress.percent(done, total)
+        if (!force && percent == lastSendPercent) return
+        lastSendPercent = percent
+        setStatus(TransferProgress.sending(done, total), connected = true)
+    }
+
+    private fun reportReceiveProgress(force: Boolean = false) {
+        val percent = receiveProgress.currentPercent()
+        if (!force && percent == receiveProgress.lastPercent) return
+        receiveProgress.lastPercent = percent
+        setStatus(
+            TransferProgress.receiving(receiveProgress.doneBytes, receiveProgress.batchTotal),
+            connected = true
+        )
     }
 
     fun pollClipboard() {
@@ -131,6 +187,7 @@ class LinkClient(
                     val sock = Socket()
                     sock.tcpNoDelay = true
                     sock.keepAlive = true
+                    sock.soTimeout = 45_000
                     sock.connect(InetSocketAddress(pairing.host, pairing.port), 10_000)
                     val out = DataOutputStream(sock.getOutputStream())
                     val input = DataInputStream(sock.getInputStream())
@@ -170,10 +227,13 @@ class LinkClient(
         val buffer = ByteArray(256 * 1024)
         while (scope.isActive && socket?.isConnected == true) {
             val read = runCatching { input.read(buffer) }.getOrElse { -1 }
-            if (read <= 0) break
-
-            for (i in 0 until read) receiveBuffer.add(buffer[i])
-            processBuffer()
+            if (read > 0) {
+                for (i in 0 until read) receiveBuffer.add(buffer[i])
+                processBuffer()
+                continue
+            }
+            if (read < 0) break
+            // read == 0 with SO_TIMEOUT: keep connection alive while screen is off
         }
         handleConnectionLost("Connection lost")
     }
@@ -223,6 +283,7 @@ class LinkClient(
                         val sock = Socket()
                         sock.tcpNoDelay = true
                         sock.keepAlive = true
+                        sock.soTimeout = 45_000
                         sock.connect(InetSocketAddress(pairing.host, pairing.port), 10_000)
                         val out = DataOutputStream(sock.getOutputStream())
                         val input = DataInputStream(sock.getInputStream())
@@ -292,12 +353,18 @@ class LinkClient(
 
             MessageType.FILE_BEGIN -> {
                 val json = LinkProtocol.jsonObject(payload) ?: return
+                val path = json.optString("path").takeIf { it.isNotEmpty() }
+                val size = json.getLong("size")
+                val batchTotal = json.optLong("batchTotal", size)
+                val batchOffset = json.optLong("batchOffset", 0)
                 fileReceiver.handleBegin(
                     id = json.getString("id"),
                     name = json.getString("name"),
-                    size = json.getLong("size")
+                    size = size,
+                    relativePath = path
                 )
-                setStatus("Receiving ${json.getString("name")}…", connected = true)
+                receiveProgress.begin(batchTotal, batchOffset)
+                reportReceiveProgress(force = true)
             }
 
             MessageType.FILE_CHUNK -> {
@@ -313,6 +380,8 @@ class LinkClient(
                     offset = json.getLong("offset"),
                     data = chunk
                 )
+                receiveProgress.trackChunk(json.getLong("offset"), chunk.size)
+                reportReceiveProgress()
             }
 
             MessageType.FILE_END -> {
@@ -360,7 +429,7 @@ class LinkClient(
         pingJob?.cancel()
         pingJob = scope.launch(Dispatchers.IO) {
             while (isActive && _connected.value) {
-                delay(15_000)
+                delay(10_000)
                 sendType(MessageType.PING)
             }
         }
@@ -368,7 +437,7 @@ class LinkClient(
 
     private fun startClipboardPolling() {
         clipboardPollJob?.cancel()
-        clipboardPollJob = scope.launch(Dispatchers.Main) {
+        clipboardPollJob = scope.launch(Dispatchers.Default) {
             while (isActive && _connected.value) {
                 clipboardMonitor?.poll()
                 delay(500)

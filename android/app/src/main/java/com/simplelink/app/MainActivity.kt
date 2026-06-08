@@ -1,11 +1,13 @@
 package com.simplelink.app
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -20,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -38,27 +41,51 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import android.widget.Toast
+import com.simplelink.app.ui.theme.SimpleLinkTheme
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.common.InputImage
 import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
+    private val pendingShareState = mutableStateOf<SharePayload?>(null)
 
-        val sharedUri = when (intent?.action) {
-            android.content.Intent.ACTION_SEND -> intent.getParcelableExtra(
-                android.content.Intent.EXTRA_STREAM,
-                Uri::class.java
+    override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.auto(
+                android.graphics.Color.TRANSPARENT,
+                android.graphics.Color.TRANSPARENT
+            ),
+            navigationBarStyle = SystemBarStyle.auto(
+                android.graphics.Color.TRANSPARENT,
+                android.graphics.Color.TRANSPARENT
             )
-            else -> null
-        }
+        )
+        super.onCreate(savedInstanceState)
+        pendingShareState.value = ShareIntentParser.parse(this, intent)
 
         setContent {
-            MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
-                    SimpleLinkScreen(pendingShareUri = sharedUri)
+            SimpleLinkTheme {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    val pendingShare by pendingShareState
+                    SimpleLinkScreen(
+                        pendingShare = pendingShare,
+                        onShareConsumed = { pendingShareState.value = null }
+                    )
                 }
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        pendingShareState.value = ShareIntentParser.parse(this, intent)
+        if (intent.action == Intent.ACTION_SEND || intent.action == Intent.ACTION_SEND_MULTIPLE) {
+            if (LinkSession.connected.value) {
+                moveTaskToBack(true)
             }
         }
     }
@@ -70,13 +97,16 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun SimpleLinkScreen(pendingShareUri: Uri?) {
+fun SimpleLinkScreen(
+    pendingShare: SharePayload?,
+    onShareConsumed: () -> Unit
+) {
     val context = LocalContext.current
     val status by LinkSession.status.collectAsState()
     val connected by LinkSession.connected.collectAsState()
     val lastFile by LinkSession.lastReceivedFile.collectAsState()
     var showScanner by remember { mutableStateOf(!connected) }
-    var handledShare by remember { mutableStateOf(false) }
+    var shareNoticeShown by remember { mutableStateOf(false) }
 
     val notificationPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -94,15 +124,58 @@ fun SimpleLinkScreen(pendingShareUri: Uri?) {
         }
     }
 
-    val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        uri ?: return@rememberLauncherForActivityResult
-        contextFileFromUri(context, uri)?.let { LinkSession.sendFile(it) }
+    val pickFiles = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        val files = contextFilesFromUris(context, uris)
+        if (files.isNotEmpty()) LinkSession.sendFiles(files)
     }
 
-    LaunchedEffect(connected, pendingShareUri, handledShare) {
-        if (connected && pendingShareUri != null && !handledShare) {
-            contextFileFromUri(context, pendingShareUri)?.let { LinkSession.sendFile(it) }
-            handledShare = true
+    val pickFolder = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        uri ?: return@rememberLauncherForActivityResult
+        runCatching {
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        }
+        val files = contextFilesFromTreeUri(context, uri)
+        if (files.isNotEmpty()) {
+            LinkSession.sendFiles(files)
+        } else {
+            Toast.makeText(context, "Folder is empty", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    LaunchedEffect(pendingShare) {
+        shareNoticeShown = false
+    }
+
+    LaunchedEffect(pendingShare, connected) {
+        val payload = pendingShare ?: return@LaunchedEffect
+        if (!connected) {
+            if (!shareNoticeShown) {
+                Toast.makeText(context, "Connect to Mac first", Toast.LENGTH_LONG).show()
+                shareNoticeShown = true
+            }
+            return@LaunchedEffect
+        }
+
+        when (val result = LinkSession.handleShare(context, payload)) {
+            LinkSession.ShareResult.Sent -> {
+                onShareConsumed()
+                (context as? ComponentActivity)?.moveTaskToBack(true)
+            }
+            LinkSession.ShareResult.NotConnected -> {
+                Toast.makeText(context, "Connect to Mac first", Toast.LENGTH_LONG).show()
+            }
+            LinkSession.ShareResult.Unsupported -> {
+                Toast.makeText(context, "Cannot send this content", Toast.LENGTH_LONG).show()
+                onShareConsumed()
+            }
         }
     }
 
@@ -113,6 +186,7 @@ fun SimpleLinkScreen(pendingShareUri: Uri?) {
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .systemBarsPadding()
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
@@ -146,11 +220,19 @@ fun SimpleLinkScreen(pendingShareUri: Uri?) {
         }
 
         Button(
-            onClick = { pickFile.launch(arrayOf("*/*")) },
+            onClick = { pickFiles.launch(arrayOf("*/*")) },
             enabled = connected,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text("Send file to Mac")
+            Text("Send files to Mac")
+        }
+
+        Button(
+            onClick = { pickFolder.launch(null) },
+            enabled = connected,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Send folder to Mac")
         }
 
         if (connected) {
@@ -164,7 +246,7 @@ fun SimpleLinkScreen(pendingShareUri: Uri?) {
                 Text("Disconnect")
             }
             Text(
-                "Connection restores automatically after Wi‑Fi returns. Files save to Download/SimpleLink/.",
+                "Share text or files from other apps — text goes to Mac clipboard, files to Downloads/SimpleLink/.",
                 style = MaterialTheme.typography.bodySmall
             )
         }

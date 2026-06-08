@@ -20,13 +20,14 @@ struct MenuBarMenu: View {
                 NSApp.activate(ignoringOtherApps: true)
             }
 
-            Button("Send File to Android…") {
+            Button("Send to Android…") {
                 let panel = NSOpenPanel()
                 panel.canChooseFiles = true
-                panel.canChooseDirectories = false
-                panel.allowsMultipleSelection = false
-                if panel.runModal() == .OK, let url = panel.url {
-                    server.sendFile(url: url)
+                panel.canChooseDirectories = true
+                panel.allowsMultipleSelection = true
+                panel.message = "Select files or folders to send"
+                if panel.runModal() == .OK {
+                    server.sendFiles(urls: panel.urls)
                 }
             }
             .disabled(!server.isConnected)
