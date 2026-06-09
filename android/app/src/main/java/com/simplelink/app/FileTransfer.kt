@@ -10,23 +10,11 @@ import android.provider.OpenableColumns
 import android.provider.MediaStore
 import androidx.documentfile.provider.DocumentFile
 import org.json.JSONObject
+import java.io.BufferedOutputStream
 import java.io.DataOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStream
-import java.io.RandomAccessFile
-
-object TransferProgress {
-    fun percent(done: Long, total: Long): Int {
-        if (total <= 0) return 0
-        return minOf(100, ((done * 100) / total).toInt())
-    }
-
-    fun sending(done: Long, total: Long): String =
-        "${percent(done, total)}% — Sending…"
-
-    fun receiving(done: Long, total: Long): String =
-        "${percent(done, total)}% — Receiving…"
-}
 
 class BatchReceiveProgress {
     var batchTotal: Long = 0
@@ -48,6 +36,13 @@ class BatchReceiveProgress {
         currentFileReceived = maxOf(currentFileReceived, offset + size)
     }
 
+    fun reset() {
+        batchTotal = 0
+        batchOffset = 0
+        currentFileReceived = 0
+        lastPercent = -1
+    }
+
     val doneBytes: Long
         get() = minOf(batchOffset + currentFileReceived, batchTotal)
 
@@ -64,31 +59,66 @@ object PathUtils {
 class FileReceiver(private val context: Context) {
     private data class OpenTransfer(
         val relativePath: String,
-        val tempFile: File
+        val tempFile: File,
+        val output: BufferedOutputStream,
+        var bytesWritten: Long = 0
     )
 
     private val openFiles = mutableMapOf<String, OpenTransfer>()
 
     fun handleBegin(id: String, name: String, size: Long, relativePath: String?) {
+        closeTransfer(id)
         val rel = PathUtils.sanitize(relativePath ?: name)
         val safeName = File(rel).name
         val tempFile = File(context.cacheDir, "incoming-$id-$safeName")
         if (tempFile.exists()) tempFile.delete()
-        tempFile.createNewFile()
-        openFiles[id] = OpenTransfer(relativePath = rel, tempFile = tempFile)
+        openFiles[id] = OpenTransfer(
+            relativePath = rel,
+            tempFile = tempFile,
+            output = BufferedOutputStream(FileOutputStream(tempFile), 256 * 1024)
+        )
     }
 
-    fun handleChunk(id: String, offset: Long, data: ByteArray) {
+    fun handleChunk(
+        id: String,
+        offset: Long,
+        data: ByteArray,
+        dataOffset: Int = 0,
+        dataLength: Int = data.size
+    ) {
         val entry = openFiles[id] ?: return
-        RandomAccessFile(entry.tempFile, "rw").use { raf ->
-            raf.seek(offset)
-            raf.write(data)
-        }
+        if (offset != entry.bytesWritten) return
+        entry.output.write(data, dataOffset, dataLength)
+        entry.bytesWritten += dataLength
     }
 
     fun handleEnd(id: String): ReceivedFile? {
         val entry = openFiles.remove(id) ?: return null
+        runCatching {
+            entry.output.flush()
+            entry.output.close()
+        }
         return publishToDownloads(entry.tempFile, entry.relativePath)
+    }
+
+    fun closeAll() {
+        for ((_, entry) in openFiles) {
+            runCatching {
+                entry.output.flush()
+                entry.output.close()
+            }
+            entry.tempFile.delete()
+        }
+        openFiles.clear()
+    }
+
+    private fun closeTransfer(id: String) {
+        val existing = openFiles.remove(id) ?: return
+        runCatching {
+            existing.output.flush()
+            existing.output.close()
+        }
+        existing.tempFile.delete()
     }
 
     private fun publishToDownloads(source: File, relativePath: String): ReceivedFile? {
@@ -103,14 +133,15 @@ class FileReceiver(private val context: Context) {
         val rel = PathUtils.sanitize(relativePath)
         val parts = rel.split('/')
         val fileName = parts.last()
-        val subDir = parts.dropLast(1).joinToString("/")
-        val relativeDir = if (subDir.isEmpty()) {
+        val parentPath = parts.dropLast(1).joinToString("/")
+        val relativeDir = if (parentPath.isEmpty()) {
             "${Environment.DIRECTORY_DOWNLOADS}/SimpleLink"
         } else {
-            "${Environment.DIRECTORY_DOWNLOADS}/SimpleLink/$subDir"
+            "${Environment.DIRECTORY_DOWNLOADS}/SimpleLink/$parentPath"
         }
         val resolver = context.contentResolver
 
+        ensureDownloadDirectoryExists(relativeDir)
         resolver.deleteExistingDownload(fileName, relativeDir)
 
         val values = ContentValues().apply {
@@ -119,10 +150,14 @@ class FileReceiver(private val context: Context) {
             put(MediaStore.Downloads.IS_PENDING, 1)
         }
 
-        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return null
+        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: return publishViaLegacyPath(source, relativePath)
         resolver.openOutputStream(uri)?.use { output ->
             source.inputStream().use { input -> input.copyTo(output) }
-        } ?: return null
+        } ?: run {
+            resolver.delete(uri, null, null)
+            return publishViaLegacyPath(source, relativePath)
+        }
 
         resolver.update(uri, ContentValues().apply {
             put(MediaStore.Downloads.IS_PENDING, 0)
@@ -133,6 +168,13 @@ class FileReceiver(private val context: Context) {
             name = fileName,
             path = "Download/SimpleLink/$rel"
         )
+    }
+
+    private fun ensureDownloadDirectoryExists(relativeDir: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return
+        val base = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val dir = File(base, relativeDir.removePrefix("${Environment.DIRECTORY_DOWNLOADS}/"))
+        dir.mkdirs()
     }
 
     @Suppress("DEPRECATION")
@@ -164,7 +206,7 @@ class FileReceiver(private val context: Context) {
         delete(
             MediaStore.Downloads.EXTERNAL_CONTENT_URI,
             selection,
-            arrayOf(name, "$relativePath/")
+            arrayOf(name, relativePath)
         )
     }
 }
@@ -180,24 +222,24 @@ class FileSender {
         output: DataOutputStream,
         batchTotal: Long,
         batchOffset: Long,
-        onProgress: ((Long, Long) -> Unit)? = null
+        onProgress: ((Long, Long) -> Unit)? = null,
+        shouldCancel: () -> Boolean = { false }
     ) {
         val id = java.util.UUID.randomUUID().toString()
         val begin = JSONObject()
             .put("id", id)
             .put("name", file.name)
             .put("size", file.size)
+            .put("path", file.relativePath)
             .put("batchTotal", batchTotal)
             .put("batchOffset", batchOffset)
-        if (file.relativePath != file.name) {
-            begin.put("path", file.relativePath)
-        }
         output.writeFrame(MessageType.FILE_BEGIN, LinkProtocol.jsonBytes(begin))
 
         file.openStream().use { input ->
             val buffer = ByteArray(LinkProtocol.CHUNK_SIZE)
             var offset = 0L
             while (true) {
+                if (shouldCancel()) throw java.util.concurrent.CancellationException()
                 val read = input.read(buffer)
                 if (read <= 0) break
 
@@ -218,6 +260,7 @@ class FileSender {
         }
 
         output.writeFrame(MessageType.FILE_END, LinkProtocol.jsonBytes(JSONObject().put("id", id)))
+        output.flush()
     }
 }
 

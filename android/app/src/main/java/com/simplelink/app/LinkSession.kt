@@ -17,6 +17,7 @@ object LinkSession {
     private val fallbackStatus = MutableStateFlow("Not connected")
     private val fallbackConnected = MutableStateFlow(false)
     private val fallbackLastFile = MutableStateFlow<String?>(null)
+    private val fallbackTransfer = MutableStateFlow(TransferProgressState())
 
     fun init(app: Application) {
         appContext = app.applicationContext
@@ -43,6 +44,9 @@ object LinkSession {
     val lastReceivedFile: StateFlow<String?>
         get() = if (::client.isInitialized) client.lastReceivedFile else fallbackLastFile
 
+    val transferProgress: StateFlow<TransferProgressState>
+        get() = if (::client.isInitialized) client.transferProgress else fallbackTransfer
+
     fun connect(context: Context, pairing: PairingPayload) {
         ensureReady()
         LinkForegroundService.connect(context, pairing.toJson())
@@ -51,6 +55,11 @@ object LinkSession {
     fun disconnect() {
         ensureReady()
         client.disconnect(userInitiated = true)
+    }
+
+    fun cancelTransfer() {
+        ensureReady()
+        client.cancelTransfer()
     }
 
     fun sendFile(file: ContextFile) {
@@ -65,11 +74,9 @@ object LinkSession {
 
     fun handleShare(context: Context, payload: SharePayload): ShareResult {
         ensureReady()
-        if (!client.connected.value) {
-            return ShareResult.NotConnected
-        }
         return when (payload) {
             is SharePayload.Text -> {
+                if (!client.connected.value) return ShareResult.NotConnected
                 client.sendSharedText(payload.text)
                 ShareResult.Sent
             }
@@ -77,13 +84,14 @@ object LinkSession {
                 val files = contextFilesFromUris(context, payload.uris)
                 if (files.isEmpty()) return ShareResult.Unsupported
                 client.sendFiles(files)
-                ShareResult.Sent
+                if (client.connected.value) ShareResult.Sent else ShareResult.Queued
             }
         }
     }
 
     enum class ShareResult {
         Sent,
+        Queued,
         NotConnected,
         Unsupported
     }

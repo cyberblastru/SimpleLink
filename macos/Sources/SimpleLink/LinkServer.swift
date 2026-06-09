@@ -10,6 +10,7 @@ final class LinkServer: ObservableObject {
     @Published private(set) var pairingJSON = ""
     @Published private(set) var lastReceivedFile: String?
     @Published private(set) var localAddress = "127.0.0.1"
+    @Published private(set) var transferProgress = TransferProgressState()
 
     let clipboard = ClipboardMonitor()
     private let fileReceiver = FileReceiver()
@@ -22,6 +23,7 @@ final class LinkServer: ObservableObject {
     private var keepAliveTimer: Timer?
     private var receiveProgress = BatchReceiveProgress()
     private var lastSendPercent = -1
+    private var activeSendTask: Task<Void, Never>?
 
     func start() {
         authToken = UUID().uuidString
@@ -77,47 +79,77 @@ final class LinkServer: ObservableObject {
     }
 
     func restartPairing() {
+        cancelTransfer()
         connection?.cancel()
         connection = nil
         isConnected = false
         authToken = UUID().uuidString
         updatePairingJSON()
         statusText = "Waiting for Android…"
+        lastReceivedFile = nil
+    }
+
+    func cancelTransfer() {
+        activeSendTask?.cancel()
+        activeSendTask = nil
+        fileReceiver.closeAll()
+        receiveProgress.reset()
+        clearTransferProgress()
+        lastReceivedFile = nil
+        lastSendPercent = -1
+        if isConnected {
+            statusText = "Connected"
+        }
     }
 
     func sendFiles(urls: [URL]) {
-        guard isConnected else {
+        guard isConnected, let connection else {
             statusText = "Connect Android first"
             return
         }
         guard !urls.isEmpty else { return }
+        activeSendTask?.cancel()
         lastSendPercent = -1
-        Task.detached { [weak self] in
+        activeSendTask = Task.detached { [weak self, connection] in
             do {
                 let sender = await MainActor.run { self?.fileSender }
                 guard let sender else { return }
                 let count = try sender.collectItems(from: urls).count
                 try sender.sendItems(from: urls, emit: { type, payload in
-                    Task { @MainActor in
-                        self?.send(type: type, payload: payload)
-                    }
+                    let frame = LinkProtocol.encode(type: type, payload: payload)
+                    let semaphore = DispatchSemaphore(value: 0)
+                    connection.send(content: frame, completion: .contentProcessed { _ in
+                        semaphore.signal()
+                    })
+                    semaphore.wait()
                 }, onProgress: { done, total in
                     Task { @MainActor in
                         self?.reportSendProgress(done: done, total: total)
                     }
                 })
                 await MainActor.run {
+                    guard let self, !Task.isCancelled else { return }
                     if count == 1, let name = urls.first?.lastPathComponent {
-                        self?.statusText = "Sent \(name)"
+                        self.statusText = "Sent \(name)"
                     } else {
-                        self?.statusText = "Sent \(count) items"
+                        self.statusText = "Sent \(count) items"
                     }
-                    self?.lastSendPercent = -1
+                    self.clearTransferProgress()
+                    self.lastSendPercent = -1
+                    self.activeSendTask = nil
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    self?.cancelTransfer()
                 }
             } catch {
                 await MainActor.run {
-                    self?.statusText = "Send failed: \(error.localizedDescription)"
+                    self?.clearTransferUiState()
+                    if self?.isConnected == true {
+                        self?.statusText = "Connected"
+                    }
                     self?.lastSendPercent = -1
+                    self?.activeSendTask = nil
                 }
             }
         }
@@ -127,17 +159,41 @@ final class LinkServer: ObservableObject {
         let percent = TransferProgress.percent(done: done, total: total)
         guard percent != lastSendPercent else { return }
         lastSendPercent = percent
-        statusText = TransferProgress.sending(done: done, total: total)
+        let label = TransferProgress.sending(done: done, total: total)
+        statusText = label
+        transferProgress = TransferProgressState(
+            direction: .sending,
+            done: done,
+            total: total,
+            label: label
+        )
     }
 
     private func reportReceiveProgress() {
         let percent = receiveProgress.currentPercent()
         guard percent != receiveProgress.lastPercent else { return }
         receiveProgress.markReported(percent)
-        statusText = TransferProgress.receiving(
+        let label = TransferProgress.receiving(
             done: receiveProgress.doneBytes,
             total: receiveProgress.batchTotal
         )
+        statusText = label
+        transferProgress = TransferProgressState(
+            direction: .receiving,
+            done: receiveProgress.doneBytes,
+            total: receiveProgress.batchTotal,
+            label: label
+        )
+    }
+
+    private func clearTransferProgress() {
+        transferProgress = TransferProgressState()
+    }
+
+    private func clearTransferUiState() {
+        clearTransferProgress()
+        lastReceivedFile = nil
+        receiveProgress.reset()
     }
 
     func sendFile(url: URL) {
@@ -242,6 +298,7 @@ final class LinkServer: ObservableObject {
                   let id = json["id"] as? String else { return }
             if let url = fileReceiver.handleEnd(id: id) {
                 lastReceivedFile = url.lastPathComponent
+                clearTransferProgress()
                 statusText = "Received \(url.lastPathComponent)"
             }
 
@@ -282,8 +339,12 @@ final class LinkServer: ObservableObject {
         keepAliveTimer?.invalidate()
         keepAliveTimer = nil
         clipboard.stop()
+        activeSendTask?.cancel()
+        activeSendTask = nil
+        fileReceiver.closeAll()
         isConnected = false
-        statusText = "Waiting for phone to reconnect…"
+        clearTransferUiState()
+        statusText = "Waiting for Android…"
         connection = nil
     }
 

@@ -35,12 +35,16 @@ enum IconDrawing {
     }
 
     static func drawStatusBarIcon(in rect: NSRect) {
+        let frameInset: CGFloat = 0.5
+        let cornerRadius: CGFloat = 3
+        let border: CGFloat = 1.5
+
         let outer = NSBezierPath(
-            roundedRect: rect.insetBy(dx: 1, dy: 1),
-            xRadius: 3.5,
-            yRadius: 3.5
+            roundedRect: rect.insetBy(dx: frameInset, dy: frameInset),
+            xRadius: cornerRadius,
+            yRadius: cornerRadius
         )
-        let cutout = diamondPath(in: rect.insetBy(dx: 4.5, dy: 4.5))
+        let cutout = diamondPath(in: rect.insetBy(dx: border, dy: border))
         outer.append(cutout)
         outer.windingRule = .evenOdd
 

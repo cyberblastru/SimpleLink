@@ -20,10 +20,10 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.material3.Button
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -83,11 +83,6 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         pendingShareState.value = ShareIntentParser.parse(this, intent)
-        if (intent.action == Intent.ACTION_SEND || intent.action == Intent.ACTION_SEND_MULTIPLE) {
-            if (LinkSession.connected.value) {
-                moveTaskToBack(true)
-            }
-        }
     }
 
     override fun onResume() {
@@ -105,7 +100,7 @@ fun SimpleLinkScreen(
     val status by LinkSession.status.collectAsState()
     val connected by LinkSession.connected.collectAsState()
     val lastFile by LinkSession.lastReceivedFile.collectAsState()
-    var showScanner by remember { mutableStateOf(!connected) }
+    val transfer by LinkSession.transferProgress.collectAsState()
     var shareNoticeShown by remember { mutableStateOf(false) }
 
     val notificationPermission = rememberLauncherForActivityResult(
@@ -154,33 +149,22 @@ fun SimpleLinkScreen(
         shareNoticeShown = false
     }
 
-    LaunchedEffect(pendingShare, connected) {
+    LaunchedEffect(pendingShare) {
         val payload = pendingShare ?: return@LaunchedEffect
-        if (!connected) {
-            if (!shareNoticeShown) {
-                Toast.makeText(context, "Connect to Mac first", Toast.LENGTH_LONG).show()
-                shareNoticeShown = true
-            }
-            return@LaunchedEffect
-        }
-
         when (val result = LinkSession.handleShare(context, payload)) {
-            LinkSession.ShareResult.Sent -> {
-                onShareConsumed()
-                (context as? ComponentActivity)?.moveTaskToBack(true)
-            }
+            LinkSession.ShareResult.Sent,
+            LinkSession.ShareResult.Queued -> onShareConsumed()
             LinkSession.ShareResult.NotConnected -> {
-                Toast.makeText(context, "Connect to Mac first", Toast.LENGTH_LONG).show()
+                if (!shareNoticeShown) {
+                    Toast.makeText(context, "Connect to Mac first", Toast.LENGTH_LONG).show()
+                    shareNoticeShown = true
+                }
             }
             LinkSession.ShareResult.Unsupported -> {
                 Toast.makeText(context, "Cannot send this content", Toast.LENGTH_LONG).show()
                 onShareConsumed()
             }
         }
-    }
-
-    LaunchedEffect(connected) {
-        if (connected) showScanner = false
     }
 
     Column(
@@ -191,15 +175,14 @@ fun SimpleLinkScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Text("SimpleLink", style = MaterialTheme.typography.headlineMedium)
-        Text(if (connected) "Connected to Mac" else "Scan QR on your Mac")
-        Text(status)
 
-        lastFile?.let {
-            Text("Last file: $it", style = MaterialTheme.typography.bodySmall)
-        }
-
-        if (showScanner && !connected) {
-            QRScanner { json ->
+        if (!connected) {
+            Text("Scan QR on your Mac")
+            QRScanner(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            ) { json ->
                 PairingPayload.parse(json)?.let { pairing ->
                     runCatching {
                         LinkSession.connect(context, pairing)
@@ -211,42 +194,57 @@ fun SimpleLinkScreen(
                         ).show()
                     }
                 }
-                showScanner = false
             }
         } else {
-            Button(onClick = { showScanner = true }, modifier = Modifier.fillMaxWidth()) {
-                Text(if (connected) "Reconnect" else "Scan QR code")
+            Text("Connected to Mac")
+
+            if (transfer.active) {
+                LinearProgressIndicator(
+                    progress = { transfer.fraction },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (transfer.label.isNotEmpty()) {
+                    Text(transfer.label, style = MaterialTheme.typography.bodySmall)
+                }
+                Button(
+                    onClick = { LinkSession.cancelTransfer() },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Cancel transfer")
+                }
             }
-        }
 
-        Button(
-            onClick = { pickFiles.launch(arrayOf("*/*")) },
-            enabled = connected,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Send files to Mac")
-        }
+            if (status.isNotEmpty()) {
+                Text(status, style = MaterialTheme.typography.bodySmall)
+            }
 
-        Button(
-            onClick = { pickFolder.launch(null) },
-            enabled = connected,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Send folder to Mac")
-        }
+            lastFile?.let {
+                Text("Last file: $it", style = MaterialTheme.typography.bodySmall)
+            }
 
-        if (connected) {
             Button(
-                onClick = {
-                    LinkSession.disconnect()
-                    showScanner = true
-                },
+                onClick = { pickFiles.launch(arrayOf("*/*")) },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Send files to Mac")
+            }
+
+            Button(
+                onClick = { pickFolder.launch(null) },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Send folder to Mac")
+            }
+
+            Button(
+                onClick = { LinkSession.disconnect() },
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text("Disconnect")
             }
+
             Text(
-                "Share text or files from other apps — text goes to Mac clipboard, files to Downloads/SimpleLink/.",
+                "Share text or files from other apps to send them to your Mac.",
                 style = MaterialTheme.typography.bodySmall
             )
         }
@@ -254,7 +252,10 @@ fun SimpleLinkScreen(
 }
 
 @Composable
-fun QRScanner(onCode: (String) -> Unit) {
+fun QRScanner(
+    modifier: Modifier = Modifier,
+    onCode: (String) -> Unit
+) {
     val context = LocalContext.current
     var hasCamera by remember {
         mutableStateOf(
@@ -286,9 +287,7 @@ fun QRScanner(onCode: (String) -> Unit) {
     }
 
     AndroidView(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(280.dp),
+        modifier = modifier,
         factory = { ctx ->
             PreviewView(ctx).also { previewView ->
                 val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)

@@ -69,6 +69,14 @@ final class FileReceiver {
         try? handle.close()
         return url
     }
+
+    func closeAll() {
+        for (url, handle, _) in openFiles.values {
+            try? handle.close()
+            try? FileManager.default.removeItem(at: url)
+        }
+        openFiles.removeAll()
+    }
 }
 
 final class BatchReceiveProgress {
@@ -86,6 +94,13 @@ final class BatchReceiveProgress {
 
     func trackChunk(offset: Int64, size: Int) {
         currentFileReceived = max(currentFileReceived, offset + Int64(size))
+    }
+
+    func reset() {
+        batchTotal = 0
+        batchOffset = 0
+        currentFileReceived = 0
+        lastPercent = -1
     }
 
     var doneBytes: Int64 {
@@ -136,6 +151,7 @@ final class FileSender {
         var batchOffset: Int64 = 0
 
         for item in files {
+            try Task.checkCancellation()
             let fileSize = try fileSize(at: item.url)
             try sendFile(
                 url: item.url,
@@ -154,6 +170,7 @@ final class FileSender {
 
     private func collectDirectory(_ directory: URL, into files: inout [OutgoingFile]) throws {
         let rootPath = directory.path
+        let rootName = PathUtils.sanitize(directory.lastPathComponent)
         guard let enumerator = FileManager.default.enumerator(
             at: directory,
             includingPropertiesForKeys: [.isRegularFileKey],
@@ -163,9 +180,10 @@ final class FileSender {
         for case let fileURL as URL in enumerator {
             let values = try fileURL.resourceValues(forKeys: [.isRegularFileKey])
             guard values.isRegularFile == true else { continue }
-            let relative = fileURL.path.hasPrefix(rootPath + "/")
+            let inner = fileURL.path.hasPrefix(rootPath + "/")
                 ? String(fileURL.path.dropFirst(rootPath.count + 1))
                 : fileURL.lastPathComponent
+            let relative = "\(rootName)/\(PathUtils.sanitize(inner))"
             files.append(OutgoingFile(url: fileURL, relativePath: relative))
         }
     }
@@ -192,12 +210,10 @@ final class FileSender {
             "id": id,
             "name": name,
             "size": size,
+            "path": path,
             "batchTotal": batchTotal,
             "batchOffset": batchOffset
         ]
-        if path != name {
-            beginPayload["path"] = path
-        }
         emit(.fileBegin, LinkProtocol.jsonData(beginPayload))
 
         let handle = try FileHandle(forReadingFrom: url)
@@ -205,6 +221,7 @@ final class FileSender {
 
         var offset: Int64 = 0
         while true {
+            try Task.checkCancellation()
             guard let chunk = try handle.read(upToCount: LinkProtocol.chunkSize), !chunk.isEmpty else { break }
 
             let header = LinkProtocol.jsonData([

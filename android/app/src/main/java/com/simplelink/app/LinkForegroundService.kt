@@ -80,6 +80,15 @@ class LinkForegroundService : Service() {
         promoteToForeground(status, connected)
     }
 
+    internal fun updateStatusText(status: String, connected: Boolean) {
+        if (!::locks.isInitialized) return
+        locks.acquire()
+        getSystemService(NotificationManager::class.java).notify(
+            NOTIFICATION_ID,
+            buildNotification(status, connected)
+        )
+    }
+
     private fun promoteToForeground(status: String, connected: Boolean) {
         ServiceCompat.startForeground(
             this,

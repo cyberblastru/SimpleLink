@@ -35,42 +35,88 @@ object LinkProtocol {
         return buffer.array()
     }
 
-    fun decodeFrames(buffer: MutableList<Byte>): List<Pair<MessageType, ByteArray>> {
+    fun jsonObject(payload: ByteArray): JSONObject? =
+        runCatching { JSONObject(String(payload, Charsets.UTF_8)) }.getOrNull()
+
+    fun jsonObject(payload: ByteArray, offset: Int, length: Int): JSONObject? =
+        runCatching { JSONObject(String(payload, offset, length, Charsets.UTF_8)) }.getOrNull()
+
+    fun jsonBytes(obj: JSONObject): ByteArray = obj.toString().toByteArray(Charsets.UTF_8)
+}
+
+class FrameBuffer {
+    private var data = ByteArray(256 * 1024)
+    private var size = 0
+
+    fun clear() {
+        size = 0
+    }
+
+    fun append(source: ByteArray, offset: Int, length: Int) {
+        if (length <= 0) return
+        ensureCapacity(size + length)
+        System.arraycopy(source, offset, data, size, length)
+        size += length
+    }
+
+    fun decodeFrames(): List<Pair<MessageType, ByteArray>> {
         val messages = mutableListOf<Pair<MessageType, ByteArray>>()
+        var offset = 0
 
-        while (buffer.size >= 9) {
-            val prefix = ByteArray(4)
-            for (i in 0 until 4) prefix[i] = buffer[i]
-            if (!prefix.contentEquals(magic)) {
-                buffer.removeAt(0)
+        while (size - offset >= 9) {
+            if (!hasMagicAt(offset)) {
+                offset++
                 continue
             }
 
-            val typeRaw = buffer[4]
-            val type = MessageType.from(typeRaw)
+            val type = MessageType.from(data[offset + 4])
             if (type == null) {
-                buffer.removeAt(0)
+                offset++
                 continue
             }
-            val lengthBytes = ByteArray(4)
-            for (i in 0 until 4) lengthBytes[i] = buffer[5 + i]
-            val length = ByteBuffer.wrap(lengthBytes).order(ByteOrder.BIG_ENDIAN).int
-            val total = 9 + length
-            if (buffer.size < total) break
 
-            repeat(9) { buffer.removeAt(0) }
-            val payload = ByteArray(length)
-            for (i in 0 until length) payload[i] = buffer.removeAt(0)
+            val length = ByteBuffer.wrap(data, offset + 5, 4)
+                .order(ByteOrder.BIG_ENDIAN)
+                .int
+            if (length < 0) {
+                offset++
+                continue
+            }
+
+            val total = 9 + length
+            if (size - offset < total) break
+
+            val payload = data.copyOfRange(offset + 9, offset + total)
             messages.add(type to payload)
+            offset += total
+        }
+
+        if (offset > 0) {
+            val remaining = size - offset
+            if (remaining > 0) {
+                System.arraycopy(data, offset, data, 0, remaining)
+            }
+            size = remaining
         }
 
         return messages
     }
 
-    fun jsonObject(payload: ByteArray): JSONObject? =
-        runCatching { JSONObject(String(payload, Charsets.UTF_8)) }.getOrNull()
+    private fun hasMagicAt(offset: Int): Boolean {
+        return data[offset] == LinkProtocol.magic[0] &&
+            data[offset + 1] == LinkProtocol.magic[1] &&
+            data[offset + 2] == LinkProtocol.magic[2] &&
+            data[offset + 3] == LinkProtocol.magic[3]
+    }
 
-    fun jsonBytes(obj: JSONObject): ByteArray = obj.toString().toByteArray(Charsets.UTF_8)
+    private fun ensureCapacity(required: Int) {
+        if (required <= data.size) return
+        var newSize = data.size
+        while (newSize < required) {
+            newSize *= 2
+        }
+        data = data.copyOf(newSize)
+    }
 }
 
 data class PairingPayload(
@@ -99,5 +145,9 @@ enum class DeviceSide(val value: String) {
 
 fun DataOutputStream.writeFrame(type: MessageType, payload: ByteArray = ByteArray(0)) {
     write(LinkProtocol.encode(type, payload))
+}
+
+fun DataOutputStream.writeFrameAndFlush(type: MessageType, payload: ByteArray = ByteArray(0)) {
+    writeFrame(type, payload)
     flush()
 }

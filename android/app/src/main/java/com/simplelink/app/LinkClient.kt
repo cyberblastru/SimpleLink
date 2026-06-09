@@ -31,6 +31,12 @@ class LinkClient(
     private val _lastReceivedFile = MutableStateFlow<String?>(null)
     val lastReceivedFile: StateFlow<String?> = _lastReceivedFile.asStateFlow()
 
+    private val _transferProgress = MutableStateFlow(TransferProgressState())
+    val transferProgress: StateFlow<TransferProgressState> = _transferProgress.asStateFlow()
+
+    private val pendingSendQueue = mutableListOf<ContextFile>()
+    private var queueOwnerToken: String? = null
+
     private var socket: Socket? = null
     private var output: DataOutputStream? = null
     private var readJob: Job? = null
@@ -45,16 +51,22 @@ class LinkClient(
     private var reconnectAttempt = 0
     private var pendingPairing: PairingPayload? = null
 
-    private val receiveBuffer = mutableListOf<Byte>()
+    private val receiveBuffer = FrameBuffer()
     private val fileReceiver = FileReceiver(context)
     private val fileSender = FileSender()
     private val receiveProgress = BatchReceiveProgress()
     private var lastSendPercent = -1
+    @Volatile
+    private var cancelTransferRequested = false
     private var clipboardMonitor: ClipboardMonitor? = null
 
     fun connect(pairing: PairingPayload, enableAutoReconnect: Boolean = true) {
         userInitiatedDisconnect = false
         autoReconnectEnabled = enableAutoReconnect
+        if (queueOwnerToken != null && queueOwnerToken != pairing.token) {
+            clearSendQueue()
+        }
+        queueOwnerToken = pairing.token
         pendingPairing = pairing
         PairingStore.save(context, pairing)
         connectInternal(pairing)
@@ -77,6 +89,7 @@ class LinkClient(
             reconnectJob?.cancel()
             reconnectJob = null
             PairingStore.clear(context)
+            clearSendQueue()
         }
 
         pingJob?.cancel()
@@ -89,12 +102,30 @@ class LinkClient(
         output = null
         socket = null
         receiveBuffer.clear()
+        cancelTransferRequested = false
+        clearTransferUiState()
         _connected.value = false
+        _status.value = ""
 
         if (userInitiated) {
-            _status.value = "Disconnected"
-            LinkSession.onConnectionChanged(false, _status.value)
+            LinkSession.onConnectionChanged(false, "")
             LinkForegroundService.stop(context)
+        }
+    }
+
+    fun cancelTransfer() {
+        scope.launch(Dispatchers.IO) {
+            sendMutex.withLock {
+                cancelTransferRequested = true
+                pendingSendQueue.clear()
+                fileReceiver.closeAll()
+                receiveProgress.reset()
+                clearTransferUiState()
+                cancelTransferRequested = false
+                if (_connected.value) {
+                    setStatus("Connected", connected = true)
+                }
+            }
         }
     }
 
@@ -118,56 +149,171 @@ class LinkClient(
 
     fun sendFiles(files: List<ContextFile>) {
         if (files.isEmpty()) return
-        val out = output ?: run {
-            setStatus("Not connected", connected = false)
-            return
-        }
         scope.launch(Dispatchers.IO) {
-            try {
-                val batchTotal = files.sumOf { it.size.coerceAtLeast(0) }.coerceAtLeast(1)
-                var batchOffset = 0L
-                lastSendPercent = -1
-                sendMutex.withLock {
-                    files.forEach { file ->
-                        fileSender.send(
-                            file = file,
-                            output = out,
-                            batchTotal = batchTotal,
-                            batchOffset = batchOffset
-                        ) { done, total ->
-                            reportSendProgress(done, total)
-                        }
-                        batchOffset += file.size.coerceAtLeast(0)
+            sendMutex.withLock {
+                enqueueFiles(files)
+                if (_connected.value && output != null) {
+                    flushSendQueue()
+                } else {
+                    updateQueuedStatus()
+                    if (!userInitiatedDisconnect &&
+                        (PairingStore.load(context) != null || pendingPairing != null)
+                    ) {
+                        tryAutoReconnect()
                     }
                 }
-                reportSendProgress(batchTotal, batchTotal, force = true)
-                setStatus(
-                    if (files.size == 1) "Sent ${files.first().name}" else "Sent ${files.size} items",
-                    connected = true
-                )
-                lastSendPercent = -1
-            } catch (e: Exception) {
-                setStatus("Send failed: ${e.message}", connected = _connected.value)
-                lastSendPercent = -1
             }
         }
+    }
+
+    fun queueFiles(files: List<ContextFile>): Boolean {
+        if (files.isEmpty()) return false
+        scope.launch(Dispatchers.IO) {
+            sendMutex.withLock {
+                enqueueFiles(files)
+                updateQueuedStatus()
+                if (!userInitiatedDisconnect &&
+                    (PairingStore.load(context) != null || pendingPairing != null)
+                ) {
+                    tryAutoReconnect()
+                }
+            }
+        }
+        return true
+    }
+
+    private fun enqueueFiles(files: List<ContextFile>) {
+        val token = PairingStore.load(context)?.token ?: pendingPairing?.token
+        if (token != null) {
+            resetQueueIfNewDevice(token)
+            queueOwnerToken = token
+        }
+        pendingSendQueue.addAll(files)
+    }
+
+    private fun resetQueueIfNewDevice(token: String) {
+        if (queueOwnerToken != null && queueOwnerToken != token) {
+            clearSendQueue()
+        }
+    }
+
+    private fun clearSendQueue() {
+        pendingSendQueue.clear()
+        queueOwnerToken = null
+        if (_transferProgress.value.direction == TransferDirection.Queued) {
+            clearTransferProgress()
+        }
+    }
+
+    private suspend fun flushSendQueue() {
+        val out = output ?: return
+        if (pendingSendQueue.isEmpty()) return
+
+        val files = pendingSendQueue.toList()
+        pendingSendQueue.clear()
+        updateQueuedStatus()
+
+        try {
+            val batchTotal = files.sumOf { it.size.coerceAtLeast(0) }.coerceAtLeast(1)
+            var batchOffset = 0L
+            lastSendPercent = -1
+            files.forEach { file ->
+                fileSender.send(
+                    file = file,
+                    output = out,
+                    batchTotal = batchTotal,
+                    batchOffset = batchOffset,
+                    onProgress = { done, total ->
+                        reportSendProgress(done, total)
+                    },
+                    shouldCancel = { cancelTransferRequested }
+                )
+                batchOffset += file.size.coerceAtLeast(0)
+            }
+            reportSendProgress(batchTotal, batchTotal, force = true)
+            setStatus(
+                if (files.size == 1) "Sent ${files.first().name}" else "Sent ${files.size} items",
+                connected = true
+            )
+            clearTransferProgress()
+            lastSendPercent = -1
+        } catch (e: Exception) {
+            if (cancelTransferRequested || e is java.util.concurrent.CancellationException) {
+                clearTransferUiState()
+                cancelTransferRequested = false
+                if (_connected.value) {
+                    setStatus("Connected", connected = true)
+                }
+                return
+            }
+            pendingSendQueue.addAll(0, files)
+            clearTransferUiState()
+            if (_connected.value) {
+                setStatus("Connected", connected = true)
+            } else {
+                _status.value = ""
+            }
+            lastSendPercent = -1
+        }
+    }
+
+    private fun updateQueuedStatus() {
+        val count = pendingSendQueue.size
+        if (count == 0) {
+            if (_transferProgress.value.direction == TransferDirection.Queued) {
+                clearTransferProgress()
+            }
+            return
+        }
+        if (!_connected.value) return
+        val label = TransferProgress.queued(count)
+        _transferProgress.value = TransferProgressState(
+            direction = TransferDirection.Queued,
+            queuedFiles = count,
+            label = label
+        )
+        setStatus(label, connected = true)
     }
 
     private fun reportSendProgress(done: Long, total: Long, force: Boolean = false) {
         val percent = TransferProgress.percent(done, total)
         if (!force && percent == lastSendPercent) return
         lastSendPercent = percent
-        setStatus(TransferProgress.sending(done, total), connected = true)
+        val label = TransferProgress.sending(done, total)
+        _transferProgress.value = TransferProgressState(
+            direction = TransferDirection.Sending,
+            done = done,
+            total = total,
+            label = label
+        )
+        updateTransferStatus(label, connected = true)
     }
 
     private fun reportReceiveProgress(force: Boolean = false) {
         val percent = receiveProgress.currentPercent()
         if (!force && percent == receiveProgress.lastPercent) return
         receiveProgress.lastPercent = percent
-        setStatus(
-            TransferProgress.receiving(receiveProgress.doneBytes, receiveProgress.batchTotal),
-            connected = true
+        val label = TransferProgress.receiving(
+            receiveProgress.doneBytes,
+            receiveProgress.batchTotal
         )
+        _transferProgress.value = TransferProgressState(
+            direction = TransferDirection.Receiving,
+            done = receiveProgress.doneBytes,
+            total = receiveProgress.batchTotal,
+            label = label
+        )
+        updateTransferStatus(label, connected = true)
+    }
+
+    private fun clearTransferProgress() {
+        _transferProgress.value = TransferProgressState()
+    }
+
+    private fun clearTransferUiState() {
+        clearTransferProgress()
+        _lastReceivedFile.value = null
+        receiveProgress.reset()
     }
 
     fun pollClipboard() {
@@ -188,11 +334,14 @@ class LinkClient(
                     sock.tcpNoDelay = true
                     sock.keepAlive = true
                     sock.soTimeout = 45_000
+                    sock.receiveBufferSize = 512 * 1024
+                    sock.sendBufferSize = 512 * 1024
                     sock.connect(InetSocketAddress(pairing.host, pairing.port), 10_000)
                     val out = DataOutputStream(sock.getOutputStream())
                     val input = DataInputStream(sock.getInputStream())
 
                     sendFrame(out, MessageType.AUTH, pairing.token.toByteArray(Charsets.UTF_8))
+                    out.flush()
 
                     socket = sock
                     output = out
@@ -228,7 +377,7 @@ class LinkClient(
         while (scope.isActive && socket?.isConnected == true) {
             val read = runCatching { input.read(buffer) }.getOrElse { -1 }
             if (read > 0) {
-                for (i in 0 until read) receiveBuffer.add(buffer[i])
+                receiveBuffer.append(buffer, 0, read)
                 processBuffer()
                 continue
             }
@@ -245,14 +394,14 @@ class LinkClient(
         clipboardPollJob?.cancel()
         clipboardMonitor?.stop()
         clipboardMonitor = null
+        clearTransferUiState()
+        _status.value = ""
 
         if (userInitiatedDisconnect || !autoReconnectEnabled) {
-            _status.value = message
-            LinkSession.onConnectionChanged(false, message)
+            LinkSession.onConnectionChanged(false, "")
             return
         }
 
-        setStatus(message, connected = false)
         if (reconnectJob?.isActive != true) {
             scheduleReconnect()
         }
@@ -284,10 +433,13 @@ class LinkClient(
                         sock.tcpNoDelay = true
                         sock.keepAlive = true
                         sock.soTimeout = 45_000
+                        sock.receiveBufferSize = 512 * 1024
+                        sock.sendBufferSize = 512 * 1024
                         sock.connect(InetSocketAddress(pairing.host, pairing.port), 10_000)
                         val out = DataOutputStream(sock.getOutputStream())
                         val input = DataInputStream(sock.getInputStream())
                         sendFrame(out, MessageType.AUTH, pairing.token.toByteArray(Charsets.UTF_8))
+                        out.flush()
                         socket = sock
                         output = out
                         readJob = launch { readLoop(input) }
@@ -306,6 +458,9 @@ class LinkClient(
 
     private fun closeSocket() {
         readJob?.cancel()
+        fileReceiver.closeAll()
+        receiveProgress.reset()
+        clearTransferProgress()
         runCatching { output?.close() }
         runCatching { socket?.close() }
         output = null
@@ -314,7 +469,7 @@ class LinkClient(
     }
 
     private fun processBuffer() {
-        val messages = LinkProtocol.decodeFrames(receiveBuffer)
+        val messages = receiveBuffer.decodeFrames()
         for ((type, payload) in messages) {
             handle(type, payload)
         }
@@ -326,19 +481,26 @@ class LinkClient(
                 reconnectAttempt = 0
                 reconnectJob?.cancel()
                 _connected.value = true
-                pendingPairing?.let { PairingStore.save(context, it) }
+                pendingPairing?.let {
+                    PairingStore.save(context, it)
+                    queueOwnerToken = it.token
+                }
                 setStatus("Connected", connected = true)
                 clipboardMonitor = ClipboardMonitor(context) { text ->
                     sendClipboard(text)
                 }.also { it.start() }
                 startPing()
                 startClipboardPolling()
+                scope.launch(Dispatchers.IO) {
+                    sendMutex.withLock { flushSendQueue() }
+                }
             }
 
             MessageType.AUTH_FAIL -> {
                 autoReconnectEnabled = false
                 reconnectJob?.cancel()
                 PairingStore.clear(context)
+                clearSendQueue()
                 setStatus("Pairing expired — scan QR again", connected = false)
                 disconnect(userInitiated = true)
             }
@@ -353,13 +515,14 @@ class LinkClient(
 
             MessageType.FILE_BEGIN -> {
                 val json = LinkProtocol.jsonObject(payload) ?: return
-                val path = json.optString("path").takeIf { it.isNotEmpty() }
+                val name = json.getString("name")
+                val path = json.optString("path").takeIf { it.isNotEmpty() } ?: name
                 val size = json.getLong("size")
                 val batchTotal = json.optLong("batchTotal", size)
                 val batchOffset = json.optLong("batchOffset", 0)
                 fileReceiver.handleBegin(
                     id = json.getString("id"),
-                    name = json.getString("name"),
+                    name = name,
                     size = size,
                     relativePath = path
                 )
@@ -373,14 +536,18 @@ class LinkClient(
                     .order(java.nio.ByteOrder.BIG_ENDIAN).int
                 val headerEnd = 4 + jsonLength
                 if (payload.size <= headerEnd) return
-                val json = LinkProtocol.jsonObject(payload.copyOfRange(4, headerEnd)) ?: return
-                val chunk = payload.copyOfRange(headerEnd, payload.size)
+                val json = LinkProtocol.jsonObject(payload, 4, jsonLength) ?: return
                 fileReceiver.handleChunk(
                     id = json.getString("id"),
                     offset = json.getLong("offset"),
-                    data = chunk
+                    data = payload,
+                    dataOffset = headerEnd,
+                    dataLength = payload.size - headerEnd
                 )
-                receiveProgress.trackChunk(json.getLong("offset"), chunk.size)
+                receiveProgress.trackChunk(
+                    json.getLong("offset"),
+                    payload.size - headerEnd
+                )
                 reportReceiveProgress()
             }
 
@@ -389,6 +556,7 @@ class LinkClient(
                 val file = fileReceiver.handleEnd(json.getString("id"))
                 if (file != null) {
                     _lastReceivedFile.value = file.path
+                    clearTransferProgress()
                     setStatus("Saved to ${file.path}", connected = true)
                 }
             }
@@ -445,9 +613,13 @@ class LinkClient(
         }
     }
 
-    private fun setStatus(message: String, connected: Boolean) {
+    private fun updateTransferStatus(message: String, connected: Boolean) {
         _status.value = message
         _connected.value = connected
+    }
+
+    private fun setStatus(message: String, connected: Boolean) {
+        updateTransferStatus(message, connected)
         LinkSession.onConnectionChanged(connected, message)
     }
 }

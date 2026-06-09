@@ -17,6 +17,21 @@ struct PairingView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     statusRow("Server", server.isListening ? "Listening" : "Offline")
                     statusRow("Phone", server.isConnected ? "Connected" : "Not connected")
+                    if server.isConnected && server.transferProgress.active {
+                        ProgressView(value: server.transferProgress.fraction)
+                            .frame(width: 180)
+                        Text(server.transferProgress.label)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button("Cancel transfer") {
+                            server.cancelTransfer()
+                        }
+                    }
+                    if server.isConnected && !server.transferProgress.active && !server.statusText.isEmpty {
+                        Text(server.statusText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     Text("IP: \(server.localAddress):\(LinkProtocol.defaultPort)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
